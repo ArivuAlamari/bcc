@@ -19,18 +19,30 @@
 const char *argp_program_version = "threadsnoop 0.1";
 const char *argp_program_bug_address = "<bpf@vger.kernel.org>";
 const char argp_program_doc[] =
-"List new thread creation. Ctrl-C to end.\n"
+"List new thread creation. Press Ctrl-C to end.\n"
 "\n"
-"USAGE: threadsnoop  [-help] \n"
+"USAGE: ./threadsnoop  [-v] \n"
 "\n";
 
 static const struct argp_option opts[] = {
+	{ "verbose", 'v', NULL, 0, "Verbose debug output" },
 	{},
 };
 
 static error_t parse_arg(int key, char *arg, struct argp_state *state)
 {
-	return ARGP_ERR_UNKNOWN;
+	switch (key) {
+	case 'v':
+		env.verbose = true;
+		break;
+	case ARGP_KEY_ARG:
+		argp_usage(state);
+		break;
+	default:
+		return ARGP_ERR_UNKNOWN;
+	}
+	return 0;
+
 }
 
 
@@ -65,6 +77,20 @@ static int open_and_attach_perf_event(int freq, struct bpf_program *prog,
 	return 0;
 }
 
+static void bump_memlock_rlimit(void)
+{
+	struct rlimit rlim_new = {
+		.rlim_cur	= RLIM_INFINITY,
+		.rlim_max	= RLIM_INFINITY,
+	};
+
+	if (setrlimit(RLIMIT_MEMLOCK, &rlim_new)) {
+		fprintf(stderr, "Failed to increase RLIMIT_MEMLOCK limit!\n");
+		exit(1);
+	}
+}
+
+
 int libbpf_print_fn(enum libbpf_print_level level,
 		    const char *format, va_list args)
 {
@@ -73,31 +99,38 @@ int libbpf_print_fn(enum libbpf_print_level level,
 	return vfprintf(stderr, format, args);
 }
 
+static volatile bool exiting = false;
+
 static void sig_handler(int sig)
 {
+	exiting = true;
 }
 
-static void print_linear_hists(struct bpf_map *hists,
-			struct threadsnoop_bpf__bss *bss)
+static int handle_event(void *ctx, void *data, size_t data_sz)
 {
-	struct hkey lookup_key = {}, next_key;
-	int err, fd = bpf_map__fd(hists);
-	struct hist hist;
+	const struct event *e = data;
+	struct tm *tm;
+	char ts[32];
+	time_t t;
 
-	while (!bpf_map_get_next_key(fd, &lookup_key, &next_key)) {
-		err = bpf_map_lookup_elem(fd, &next_key, &hist);
-		if (err < 0) {
-			fprintf(stderr, "failed to lookup hist: %d\n", err);
-			return;
-		}
-		print_linear_hist(hist.slots, MAX_SLOTS, 0, 200, next_key.comm);
+	time(&t);
+	tm = localtime(&t);
+	strftime(ts, sizeof(ts), "%H:%M:%S", tm);
+
+	if (e->exit_event) {
+		printf("%-8s %-5s %-16s %-7d %-7d [%u]",
+		       ts, "EXIT", e->comm, e->pid, e->ppid, e->exit_code);
+		if (e->duration_ns)
+			printf(" (%llums)", e->duration_ns / 1000000);
 		printf("\n");
-		lookup_key = next_key;
+	} else {
+		printf("%-8s %-5s %-16s %-7d %-7d %s\n",
+		       ts, "EXEC", e->comm, e->pid, e->ppid, e->filename);
 	}
 
-	printf("\n");
-	print_linear_hist(bss->syswide.slots, MAX_SLOTS, 0, 200, "syswide");
+	return 0;
 }
+
 
 int main(int argc, char **argv)
 {
@@ -128,5 +161,48 @@ int main(int argc, char **argv)
 		fprintf(stderr, "failed to open and/or load BPF object\n");
 		return 1;
 	}
+
+	/* Cleaner handling of Ctrl-C */
+	signal(SIGINT, sig_handler);
+	signal(SIGTERM, sig_handler);
+
+	/* Attach tracepoints */
+	err = threadsnoop_bpf__attach(skel);
+	if (err) {
+		fprintf(stderr, "Failed to attach BPF skeleton\n");
+		goto cleanup;
+	}
+
+	/* Set up ring buffer polling */
+	rb = ring_buffer__new(bpf_map__fd(skel->maps.rb), handle_event, NULL, NULL);
+	if (!rb) {
+		err = -1;
+		fprintf(stderr, "Failed to create ring buffer\n");
+		goto cleanup;
+	}
+
+	/* Process events */
+	printf("%-8s %-5s %-16s %-7s %-7s %s\n",
+	       "TIME", "EVENT", "COMM", "PID", "PPID", "FILENAME/EXIT CODE");
+	while (!exiting) {
+		err = ring_buffer__poll(rb, 100 /* timeout, ms */);
+		/* Ctrl-C will cause -EINTR */
+		if (err == -EINTR) {
+			err = 0;
+			break;
+		}
+		if (err < 0) {
+			printf("Error polling perf buffer: %d\n", err);
+			break;
+		}
+	}
+
+cleanup:
+	/* Clean up */
+	ring_buffer__free(rb);
+	threadsnoop_bpf__destroy(skel);
+
+	return err < 0 ? -err : 0;
+}
 
 
